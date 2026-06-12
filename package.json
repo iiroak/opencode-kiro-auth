@@ -1,0 +1,15 @@
+{
+  "name": "opencode-kiro-auth",
+  "version": "0.0.1",
+  "description": "Use your existing kiro-cli (AWS SSO/IdC) credentials as an opencode provider. No separate login.",
+  "type": "module",
+  "main": "./index.ts",
+  "exports": {
+    "./server": "./index.ts"
+  },
+  "license": "MIT",
+  "author": "Toan Doan <toandev.95@gmail.com>",
+  "peerDependencies": {
+    "@opencode-ai/plugin": "*"
+  }
+}

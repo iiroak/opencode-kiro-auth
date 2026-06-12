@@ -1,0 +1,36 @@
+import { homedir, platform } from "node:os"
+import { join } from "node:path"
+
+/** opencode provider id; must match the provider key in opencode.json. */
+export const PROVIDER_ID = "kiro"
+
+/** kiro-cli's AWS SSO token cache. auth.ts throws if missing (run `kiro-cli login`). */
+export const SSO_CACHE_DIR = join(homedir(), ".aws", "sso", "cache")
+export const TOKEN_FILE = join(SSO_CACHE_DIR, "kiro-auth-token.json")
+
+/** Refresh the access token this long before it expires. */
+export const EXPIRY_SKEW_MS = 5 * 60 * 1000
+
+/** Kiro CodeWhisperer endpoints + awsJson1.0 wire facts (verified against kiro-cli). */
+export const KIRO_ENDPOINT = "https://runtime.us-east-1.kiro.dev/"
+export const KIRO_MANAGEMENT_ENDPOINT = "https://management.us-east-1.kiro.dev/"
+export const KIRO_TARGET = "AmazonCodeWhispererStreamingService.GenerateAssistantResponse"
+export const KIRO_LIST_PROFILES_TARGET = "AmazonCodeWhispererService.ListAvailableProfiles"
+export const KIRO_CONTENT_TYPE = "application/x-amz-json-1.0"
+export const KIRO_ORIGIN = "KIRO_CLI"
+
+/**
+ * profileArn placeholder kiro-cli sends for accounts without a profile (Builder ID).
+ * Accounts that have one resolve their real ARN at runtime (profile.ts).
+ */
+export const KIRO_PROFILE_ARN_PLACEHOLDER = "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
+
+/** User-Agent matching kiro-cli. Bump KIRO_CLI_VERSION to match `kiro-cli --version`. */
+const KIRO_CLI_VERSION = "2.6.1"
+const KIRO_SDK_API_VERSION = "0.1.16551"
+const KIRO_OS = platform() === "win32" ? "windows" : platform() === "darwin" ? "macos" : "linux"
+const ua = (api: string, metric: string) =>
+  `aws-sdk-rust/1.3.15 ua/2.1 api/${api}/${KIRO_SDK_API_VERSION} os/${KIRO_OS} lang/rust/1.92.0 ${metric} app/AmazonQ-For-CLI`
+export const KIRO_USER_AGENT = ua("codewhispererstreaming", `md/appVersion-${KIRO_CLI_VERSION}`)
+export const KIRO_X_AMZ_USER_AGENT = ua("codewhispererstreaming", "m/F")
+export const KIRO_MGMT_USER_AGENT = ua("codewhispererruntime", `md/appVersion-${KIRO_CLI_VERSION}`)
