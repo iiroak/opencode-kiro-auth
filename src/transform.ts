@@ -131,12 +131,22 @@ function userEntry(msg: Message, modelId: string, tools?: ReturnType<typeof tool
   if (tr) context.toolResults = tr
   if (tools) context.tools = tools
   const imgs = images(msg.content)
-  const text = textOf(msg.content) || " "
+  const rawText = textOf(msg.content)
+
+  // A tool-result continuation turn carries no user text — only the tool_result blocks,
+  // which live in userInputMessageContext.toolResults. kiro-cli sends these with empty
+  // content and no USER MESSAGE framing. If we instead wrap whitespace in the USER MESSAGE
+  // markers, the model reads it as a blank user turn and replies "you sent an empty message"
+  // while ignoring the tool result. So only fabricate a user message when there is real text.
+  const hasToolResults = Boolean(tr)
+  const text = rawText || (hasToolResults ? "" : " ")
+  const content = isCurrent && text ? wrapCurrentContent(text) : text
+
   return {
     userInputMessage: {
       // The current turn carries kiro-cli's CONTEXT ENTRY + USER MESSAGE framing; prior
       // turns are sent as-is, matching how kiro-cli replays history.
-      content: isCurrent ? wrapCurrentContent(text) : text,
+      content,
       userInputMessageContext: context,
       origin: KIRO_ORIGIN,
       modelId,
