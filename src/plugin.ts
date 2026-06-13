@@ -9,30 +9,28 @@ import { getProfileArn } from "./profile"
 import { resolveContextLimit } from "./limits"
 import { tools } from "./tools"
 
-// TEMP diagnostic: dump the post-transform Kiro payload structure on a tool-format error.
-function dumpInvalid(anthropic: any, kiroBody: string) {
+// TEMP diagnostic: dump the post-transform Kiro payload (contents truncated) on a tool-format error.
+function dumpInvalid(_anthropic: any, kiroBody: string) {
   try {
-    const inSeq = (anthropic?.messages ?? []).map((m: any) => ({
-      role: m.role,
-      blocks: Array.isArray(m.content)
-        ? m.content.map((b: any) =>
-            b.type === "tool_use" ? `use:${b.id}` : b.type === "tool_result" ? `res:${b.tool_use_id}` : `${b.type}(${(b.text ?? "").length})`,
-          )
-        : `str(${String(m.content).length})`,
-    }))
     const cs = JSON.parse(kiroBody).conversationState
     const sum = (e: any) =>
       e.userInputMessage
         ? {
             role: "user",
-            contentLen: (e.userInputMessage.content || "").length,
-            res: (e.userInputMessage.userInputMessageContext?.toolResults ?? []).map((t: any) => t.toolUseId),
+            content: (e.userInputMessage.content ?? "").slice(0, 200),
+            contentLen: (e.userInputMessage.content ?? "").length,
+            res: (e.userInputMessage.userInputMessageContext?.toolResults ?? []).map((t: any) => ({ id: t.toolUseId, status: t.status, text: (t.content?.[0]?.text ?? "").slice(0, 80) })),
             nTools: (e.userInputMessage.userInputMessageContext?.tools ?? []).length,
           }
-        : { role: "assistant", contentLen: (e.assistantResponseMessage.content || "").length, use: (e.assistantResponseMessage.toolUses ?? []).map((t: any) => t.toolUseId) }
+        : {
+            role: "assistant",
+            content: (e.assistantResponseMessage.content ?? "").slice(0, 200),
+            contentLen: (e.assistantResponseMessage.content ?? "").length,
+            use: (e.assistantResponseMessage.toolUses ?? []).map((t: any) => ({ id: t.toolUseId, name: t.name, inputKeys: Object.keys(t.input ?? {}) })),
+          }
     writeFileSync(
       join(tmpdir(), "kiro-invalid-request.json"),
-      JSON.stringify({ input: inSeq, kiro: [...cs.history.map(sum), { current: true, ...sum(cs.currentMessage) }] }, null, 2),
+      JSON.stringify([...cs.history.map(sum), { current: true, ...sum(cs.currentMessage) }], null, 2),
     )
   } catch {
     // diagnostics must never throw
