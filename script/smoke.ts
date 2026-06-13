@@ -75,6 +75,50 @@ const mapped = mapKiroError(JSON.stringify({ reason: "CONTENT_LENGTH_EXCEEDS_THR
 checks.push(["overflow mapping", mapped.status === 400 && mapped.body.toLowerCase().includes("prompt is too long")])
 checks.push(["passthrough", mapKiroError("boom", 500).body === "boom"])
 
+// 7) Mixed tool_result + text turn (compaction): inline result, unpair tool_use, no toolResults left.
+const mixed = JSON.parse(
+  toKiroRequest(
+    {
+      model: "claude-sonnet-4.6",
+      messages: [
+        { role: "user", content: "go" },
+        { role: "assistant", content: [{ type: "tool_use", id: "ss1", name: "screenshot", input: {} }] },
+        {
+          role: "user",
+          content: [
+            { type: "tool_result", tool_use_id: "ss1", content: "shot-data" },
+            { type: "text", text: "Create a summary of the conversation." },
+          ],
+        },
+      ],
+    } as any,
+    "t",
+    "a",
+  ).init.body as string,
+).conversationState
+const mixedCurrent = mixed.currentMessage.userInputMessage
+const mixedPrevAsst = mixed.history[mixed.history.length - 1].assistantResponseMessage
+checks.push(["mixed turn drops structured toolResults", mixedCurrent.userInputMessageContext.toolResults === undefined])
+checks.push(["mixed turn keeps text", mixedCurrent.content.includes("Create a summary") && mixedCurrent.content.includes("shot-data")])
+checks.push(["preceding assistant unpaired", mixedPrevAsst.toolUses === undefined])
+
+// 8) Pure tool-result continuation (no text) stays structured.
+const pure = JSON.parse(
+  toKiroRequest(
+    {
+      model: "claude-sonnet-4.6",
+      messages: [
+        { role: "user", content: "go" },
+        { role: "assistant", content: [{ type: "tool_use", id: "x1", name: "bash", input: {} }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "x1", content: "out" }] },
+      ],
+    } as any,
+    "t",
+    "a",
+  ).init.body as string,
+).conversationState
+checks.push(["pure continuation keeps toolResults", Boolean(pure.currentMessage.userInputMessage.userInputMessageContext.toolResults)])
+
 let ok = true
 for (const [name, pass] of checks) {
   console.log(`${pass ? "PASS" : "FAIL"}  ${name}`)

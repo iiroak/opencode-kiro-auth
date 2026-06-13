@@ -133,6 +133,48 @@ function toolResults(content: string | Block[]) {
   }))
 }
 
+function stringifyResultContent(content: any): string {
+  if (typeof content === "string") return content
+  if (Array.isArray(content)) {
+    return content
+      .map((b) => (b?.type === "text" && typeof b.text === "string" ? b.text : b?.type === "image" ? "[image]" : ""))
+      .filter(Boolean)
+      .join("\n")
+  }
+  return content == null ? "" : JSON.stringify(content)
+}
+
+/**
+ * Bedrock rejects a user turn that mixes tool_result blocks with regular text
+ * ("Invalid tool use format"). opencode produces exactly that on compaction: the summary
+ * prompt is appended to the same turn that returns the last tool call. When a user turn has
+ * both, inline the tool result(s) as text and turn the matching tool_use in the preceding
+ * assistant turn into text too, so the pair degrades to plain text and the request stays valid.
+ * Pure tool-result continuations (no accompanying text) are left untouched.
+ */
+function inlineMixedToolResultTurns(messages: Message[]): void {
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i]
+    if (m.role !== "user" || typeof m.content === "string") continue
+    const results = m.content.filter((b) => b?.type === "tool_result")
+    if (!results.length) continue
+    const hasText = m.content.some((b) => b?.type === "text" && (b.text ?? "").trim().length > 0)
+    if (!hasText) continue
+
+    const ids = new Set(results.map((b) => b.tool_use_id))
+    const inlined: Block[] = results.map((b) => ({ type: "text", text: `[tool result]\n${stringifyResultContent(b.content)}`.trim() }))
+    messages[i] = { ...m, content: [...inlined, ...m.content.filter((b) => b?.type !== "tool_result")] }
+
+    const prev = messages[i - 1]
+    if (prev && prev.role === "assistant" && Array.isArray(prev.content)) {
+      messages[i - 1] = {
+        ...prev,
+        content: prev.content.map((b) => (b?.type === "tool_use" && ids.has(b.id) ? { type: "text", text: `[called ${b.name}]` } : b)),
+      }
+    }
+  }
+}
+
 function toolUses(content: string | Block[]) {
   if (typeof content === "string") return undefined
   const uses = content.filter((b) => b?.type === "tool_use")
@@ -236,6 +278,7 @@ export function toKiroRequest(
 
   // CodeWhisperer has no system role: fold the system prompt into the first user turn.
   const messages = (body.messages ?? []).map((m) => ({ ...m }))
+  inlineMixedToolResultTurns(messages)
   const sys = systemText(body.system)
   if (sys) {
     const firstUser = messages.find((m) => m.role === "user")
