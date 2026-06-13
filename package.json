@@ -9,6 +9,10 @@
   },
   "license": "MIT",
   "author": "Toan Doan <toandev.95@gmail.com>",
+  "scripts": {
+    "smoke": "bun run script/smoke.ts",
+    "check-auth": "bun run script/check-auth.ts"
+  },
   "peerDependencies": {
     "@opencode-ai/plugin": "*"
   }

@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto"
 import {
+  DEFAULT_MODEL,
   KIRO_ENDPOINT,
   KIRO_TARGET,
   KIRO_CONTENT_TYPE,
@@ -8,7 +9,6 @@ import {
   KIRO_X_AMZ_USER_AGENT,
 } from "./constants"
 import { readKiroEvents } from "./eventstream"
-import { logKiroEvent } from "./debug"
 
 /* ----------------------------- request mapping ----------------------------- */
 
@@ -21,9 +21,6 @@ type AnthropicRequest = {
   tools?: Block[]
   [key: string]: unknown
 }
-
-// Kiro rejects an empty modelId; everything else (incl. "auto") passes through.
-const DEFAULT_MODEL = "claude-sonnet-4.6"
 
 const ENV_STATE = {
   operatingSystem: process.platform === "win32" ? "windows" : process.platform === "darwin" ? "macos" : "linux",
@@ -151,16 +148,19 @@ const IMAGE_FORMATS: Record<string, string> = {
   "image/webp": "webp",
 }
 
+function isImageBlock(b: Block): boolean {
+  return b?.type === "image" && b.source?.type === "base64" && b.source?.data
+}
+
 function images(content: string | Block[]) {
   if (typeof content === "string") return undefined
-  const imgs = content.filter((b) => b?.type === "image" && b.source?.type === "base64" && b.source?.data)
+  const imgs = content.filter(isImageBlock)
   if (!imgs.length) return undefined
   return imgs.map((b) => ({ format: IMAGE_FORMATS[b.source.media_type] ?? "png", source: { bytes: b.source.data } }))
 }
 
 function hasImages(content: string | Block[]): boolean {
-  if (typeof content === "string") return false
-  return content.some((b) => b?.type === "image" && b.source?.type === "base64" && b.source?.data)
+  return typeof content !== "string" && content.some(isImageBlock)
 }
 
 // Number of most-recent image-bearing turns whose images are sent to Kiro. Older images are
@@ -350,7 +350,6 @@ export function kiroToAnthropicStream(res: Response, model: string, contextLimit
 
       try {
         for await (const ev of readKiroEvents(res)) {
-          logKiroEvent(ev)
           if (ev.eventType === "assistantResponseEvent") {
             const content = ev.payload.content
             if (typeof content !== "string" || content.length === 0) continue

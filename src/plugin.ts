@@ -1,25 +1,10 @@
 import type { Hooks, PluginInput } from "@opencode-ai/plugin"
-import { PROVIDER_ID } from "./constants"
+import { PROVIDER_ID, DEFAULT_MODEL } from "./constants"
 import { getValidAccessToken, readToken, KiroAuthError } from "./auth"
 import { toKiroRequest, kiroToAnthropicStream, mapKiroError } from "./transform"
 import { getProfileArn } from "./profile"
 import { resolveContextLimit } from "./limits"
-import { logKiroError } from "./debug"
 import { tools } from "./tools"
-
-/** Summarize images in an Anthropic request body for error diagnostics (no pixel data). */
-function summarizeImages(body: any): Array<{ mime?: string; base64Len: number }> {
-  const out: Array<{ mime?: string; base64Len: number }> = []
-  for (const msg of body?.messages ?? []) {
-    if (!Array.isArray(msg?.content)) continue
-    for (const block of msg.content) {
-      if (block?.type === "image" && block?.source?.data) {
-        out.push({ mime: block.source.media_type, base64Len: String(block.source.data).length })
-      }
-    }
-  }
-  return out
-}
 
 /**
  * opencode plugin that lets you use kiro-cli''s existing AWS SSO/IdC credentials
@@ -54,17 +39,16 @@ export async function KiroAuthPlugin(input: PluginInput): Promise<Hooks> {
         async fetch(_input: Parameters<typeof fetch>[0], init?: RequestInit) {
           const accessToken = await getValidAccessToken()
           const body = typeof init?.body === "string" && init.body.length > 0 ? JSON.parse(init.body) : {}
-          const model = typeof body.model === "string" ? body.model : "claude-sonnet-4.6"
+          const model = typeof body.model === "string" ? body.model : DEFAULT_MODEL
 
           const profileArn = await getProfileArn(accessToken)
           const request = toKiroRequest(body, accessToken, profileArn)
           const response = await fetch(request.url, request.init)
 
           if (!response.ok) {
+            // Reshape known Kiro errors (e.g. content-length overflow) into an actionable
+            // message; opencode persists the raw body in its session store for anything else.
             const detail = await response.text().catch(() => "")
-            // Capture the real failure reason (e.g. an image/size limit) that opencode drops.
-            logKiroError({ model, images: summarizeImages(body), bodyBytes: (init?.body as string)?.length ?? 0 }, response.status, detail)
-            // Reshape known Kiro errors so opencode shows an actionable message.
             const mapped = mapKiroError(detail, response.status)
             return new Response(mapped.body, {
               status: mapped.status,
@@ -72,8 +56,8 @@ export async function KiroAuthPlugin(input: PluginInput): Promise<Hooks> {
             })
           }
 
-          // Context window comes from the live opencode config (falls back to a bundled
-          // table), so the percentage we synthesize for the gauge matches what opencode shows.
+          // Context window is read from the live opencode config so the synthesized usage
+          // percentage matches what opencode shows.
           const contextLimit = await resolveContextLimit(input.client, PROVIDER_ID, model)
           return kiroToAnthropicStream(response, model, contextLimit)
         },
