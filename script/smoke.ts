@@ -17,20 +17,27 @@ const tr = cur({
 checks.push(["tool-result content empty", tr.content === ""])
 checks.push(["tool-result carried", Boolean(tr.userInputMessageContext.toolResults)])
 
-// 2) Synthesized toolConfig when tools omitted but history has tool blocks.
-const synth = cur({
-  model: "claude-sonnet-4.6",
-  messages: [
-    { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "edit", input: {} }] },
-    { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }] },
-  ],
-})
-checks.push(["synth toolConfig", (synth.userInputMessageContext.tools ?? []).some((t: any) => t.toolSpecification.name === "edit")])
-
-// 3) Plain request -> no toolConfig.
-const plain = cur({ model: "claude-sonnet-4.6", messages: [{ role: "user", content: "hi" }] })
-checks.push(["no spurious toolConfig", plain.userInputMessageContext.tools === undefined])
-checks.push(["current turn framed", plain.content.includes("--- USER MESSAGE BEGIN ---")])
+// 2) No tools sent + history has tool blocks (compaction): flatten to text, no toolConfig.
+const flat = JSON.parse(
+  toKiroRequest(
+    {
+      model: "claude-sonnet-4.6",
+      messages: [
+        { role: "assistant", content: [{ type: "tool_use", id: "t1", name: "edit", input: { path: "a.ts" } }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "t1", content: "ok" }] },
+        { role: "user", content: "summarize please" },
+      ],
+    } as any,
+    "t",
+    "a",
+  ).init.body as string,
+).conversationState
+const flatHasToolStruct = flat.history.some(
+  (e: any) => e.assistantResponseMessage?.toolUses || e.userInputMessage?.userInputMessageContext?.toolResults,
+)
+const flatHasCalledText = JSON.stringify(flat.history).includes("[called edit")
+checks.push(["no-tools flattens tool blocks", !flatHasToolStruct && flatHasCalledText])
+checks.push(["no-tools current has no toolConfig", (flat.currentMessage.userInputMessage.userInputMessageContext.tools ?? []).length === 0])
 
 // 4) Image trimming: default keep=2 across 3 image turns drops the oldest.
 delete process.env.KIRO_KEEP_IMAGE_TURNS
@@ -75,11 +82,12 @@ const mapped = mapKiroError(JSON.stringify({ reason: "CONTENT_LENGTH_EXCEEDS_THR
 checks.push(["overflow mapping", mapped.status === 400 && mapped.body.toLowerCase().includes("prompt is too long")])
 checks.push(["passthrough", mapKiroError("boom", 500).body === "boom"])
 
-// 7) Mixed tool_result + text turn (compaction): inline result, unpair tool_use, no toolResults left.
+// 7) Mixed tool_result + text turn WITH tools present: inline result, unpair tool_use.
 const mixed = JSON.parse(
   toKiroRequest(
     {
       model: "claude-sonnet-4.6",
+      tools: [{ name: "screenshot", description: "d", input_schema: { type: "object" } }],
       messages: [
         { role: "user", content: "go" },
         { role: "assistant", content: [{ type: "tool_use", id: "ss1", name: "screenshot", input: {} }] },
@@ -102,11 +110,12 @@ checks.push(["mixed turn drops structured toolResults", mixedCurrent.userInputMe
 checks.push(["mixed turn keeps text", mixedCurrent.content.includes("Create a summary") && mixedCurrent.content.includes("shot-data")])
 checks.push(["preceding assistant unpaired", mixedPrevAsst.toolUses === undefined])
 
-// 8) Pure tool-result continuation (no text) stays structured.
+// 8) Pure tool-result continuation (no text) WITH tools present stays structured.
 const pure = JSON.parse(
   toKiroRequest(
     {
       model: "claude-sonnet-4.6",
+      tools: [{ name: "bash", description: "d", input_schema: { type: "object" } }],
       messages: [
         { role: "user", content: "go" },
         { role: "assistant", content: [{ type: "tool_use", id: "x1", name: "bash", input: {} }] },

@@ -90,36 +90,32 @@ function toolSpecs(tools?: Block[]) {
   }))
 }
 
-/** Distinct tool names referenced by tool_use blocks across all messages. */
-function toolNamesFromMessages(messages: Message[]): string[] {
-  const names = new Set<string>()
-  for (const m of messages) {
+/**
+ * Flatten every tool_use/tool_result block in the conversation into plain text.
+ *
+ * Used for requests that send no tools (compaction, summaries, title generation): the model
+ * only needs to read the history, not re-run tools. Keeping structured tool blocks would
+ * require a toolConfig and subject the historical tool calls to Bedrock's tool-format
+ * validation (which rejects, e.g., inputs that don't match a synthesized empty schema). Turning
+ * them into text sidesteps all of that while preserving the information for the summary.
+ */
+function flattenToolBlocksToText(messages: Message[]): void {
+  for (let i = 0; i < messages.length; i++) {
+    const m = messages[i]
     if (typeof m.content === "string") continue
-    for (const b of m.content) {
-      if (b?.type === "tool_use" && typeof b.name === "string") names.add(b.name)
+    if (!m.content.some((b) => b?.type === "tool_use" || b?.type === "tool_result")) continue
+    messages[i] = {
+      ...m,
+      content: m.content.map((b) => {
+        if (b?.type === "tool_use") {
+          const input = b.input && Object.keys(b.input).length ? ` ${JSON.stringify(b.input)}` : ""
+          return { type: "text", text: `[called ${b.name}${input}]` }
+        }
+        if (b?.type === "tool_result") return { type: "text", text: `[tool result]\n${stringifyResultContent(b.content)}`.trim() }
+        return b
+      }),
     }
   }
-  return [...names]
-}
-
-/** Does any message carry tool_use or tool_result content blocks? */
-function hasToolBlocks(messages: Message[]): boolean {
-  return messages.some(
-    (m) => typeof m.content !== "string" && m.content.some((b) => b?.type === "tool_use" || b?.type === "tool_result"),
-  )
-}
-
-/**
- * Minimal tool specs used when the request omits tools but its history still contains
- * tool_use/tool_result blocks (e.g. compaction/summary turns). Bedrock rejects such
- * requests with TOOL_CONFIG_MISSING unless a toolConfig is present, so we reconstruct
- * placeholder specs from the tool names referenced in history.
- */
-function syntheticToolSpecs(names: string[]) {
-  if (!names.length) return undefined
-  return names.map((name) => ({
-    toolSpecification: { name, description: "", inputSchema: { json: { type: "object", properties: {} } } },
-  }))
 }
 
 function toolResults(content: string | Block[]) {
@@ -278,7 +274,17 @@ export function toKiroRequest(
 
   // CodeWhisperer has no system role: fold the system prompt into the first user turn.
   const messages = (body.messages ?? []).map((m) => ({ ...m }))
-  inlineMixedToolResultTurns(messages)
+  const tools = toolSpecs(body.tools)
+  if (tools) {
+    // Agentic request: keep structured tool blocks, but Bedrock rejects a single user turn
+    // that mixes tool_result with text, so split those.
+    inlineMixedToolResultTurns(messages)
+  } else {
+    // Utility request (compaction/summary/title) sends no tools: flatten tool blocks to text
+    // so no toolConfig is needed and Bedrock's tool-format validation can't trip.
+    flattenToolBlocksToText(messages)
+  }
+
   const sys = systemText(body.system)
   if (sys) {
     const firstUser = messages.find((m) => m.role === "user")
@@ -288,15 +294,6 @@ export function toKiroRequest(
           ? `${sys}\n\n${firstUser.content}`
           : [{ type: "text", text: sys }, ...firstUser.content]
     }
-  }
-
-  // Prefer the request's tools; if it sent none but the history references tools (common on
-  // compaction/summary turns), synthesize minimal specs so Bedrock doesn't reject the whole
-  // request with TOOL_CONFIG_MISSING.
-  let tools = toolSpecs(body.tools)
-  if (!tools && hasToolBlocks(messages)) {
-    const names = toolNamesFromMessages(messages)
-    tools = syntheticToolSpecs(names.length ? names : ["tool"])
   }
 
   // Keep images only on the most recent N image-bearing turns; strip older ones so the
