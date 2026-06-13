@@ -126,21 +126,49 @@ function images(content: string | Block[]) {
   return imgs.map((b) => ({ format: IMAGE_FORMATS[b.source.media_type] ?? "png", source: { bytes: b.source.data } }))
 }
 
-function userEntry(msg: Message, modelId: string, tools?: ReturnType<typeof toolSpecs>, isCurrent = false) {
+function hasImages(content: string | Block[]): boolean {
+  if (typeof content === "string") return false
+  return content.some((b) => b?.type === "image" && b.source?.type === "base64" && b.source?.data)
+}
+
+// Number of most-recent image-bearing turns whose images are sent to Kiro. Older images are
+// dropped from history (replaced with a placeholder) to keep the request under Kiro's
+// content-length threshold, which base64 images blow past in long sessions. Override with
+// KIRO_KEEP_IMAGE_TURNS (0 strips all images).
+const DEFAULT_KEEP_IMAGE_TURNS = 2
+
+function keepImageTurns(): number {
+  const raw = process.env.KIRO_KEEP_IMAGE_TURNS
+  const n = raw != null ? Number(raw) : NaN
+  return Number.isFinite(n) && n >= 0 ? Math.floor(n) : DEFAULT_KEEP_IMAGE_TURNS
+}
+
+function userEntry(
+  msg: Message,
+  modelId: string,
+  tools?: ReturnType<typeof toolSpecs>,
+  isCurrent = false,
+  keepImages = true,
+) {
   const context: Record<string, unknown> = { envState: ENV_STATE }
   const tr = toolResults(msg.content)
   if (tr) context.toolResults = tr
   if (tools) context.tools = tools
-  const imgs = images(msg.content)
+  const imgs = keepImages ? images(msg.content) : undefined
   const rawText = textOf(msg.content)
+  const hasToolResults = Boolean(tr)
+  const droppedImages = !keepImages && hasImages(msg.content)
 
   // A tool-result continuation turn carries no user text — only the tool_result blocks,
   // which live in userInputMessageContext.toolResults. kiro-cli sends these with empty
   // content and no USER MESSAGE framing. If we instead wrap whitespace in the USER MESSAGE
   // markers, the model reads it as a blank user turn and replies "you sent an empty message"
   // while ignoring the tool result. So only fabricate a user message when there is real text.
-  const hasToolResults = Boolean(tr)
-  const text = rawText || (hasToolResults ? "" : " ")
+  // When we drop a dated image with no accompanying text, leave a marker so the turn isn't blank.
+  let text: string
+  if (rawText) text = rawText
+  else if (droppedImages && !hasToolResults) text = "[image omitted]"
+  else text = hasToolResults ? "" : " "
   const content = isCurrent && text ? wrapCurrentContent(text) : text
 
   return {
@@ -188,18 +216,28 @@ export function toKiroRequest(
     }
   }
 
+  // Keep images only on the most recent N image-bearing turns; strip older ones so the
+  // serialized request stays under Kiro's content-length threshold.
+  const keep = keepImageTurns()
+  const imageIdx: number[] = []
+  messages.forEach((m, i) => {
+    if (hasImages(m.content)) imageIdx.push(i)
+  })
+  const keepSet = new Set(keep > 0 ? imageIdx.slice(-keep) : [])
+
   const history = messages
     .slice(0, -1)
-    .map((m) => (m.role === "assistant" ? assistantEntry(m) : userEntry(m, modelId)))
+    .map((m, i) => (m.role === "assistant" ? assistantEntry(m) : userEntry(m, modelId, undefined, false, keepSet.has(i))))
 
   const last = messages[messages.length - 1]
   const current = last && last.role !== "assistant" ? last : { role: "user", content: " " }
+  const currentKeepImages = keepSet.has(messages.length - 1)
 
   const payload = {
     profileArn,
     conversationState: {
       conversationId: randomUUID(),
-      currentMessage: userEntry(current, modelId, tools, true),
+      currentMessage: userEntry(current, modelId, tools, true, currentKeepImages),
       history,
       chatTriggerType: "MANUAL",
       agentContinuationId: randomUUID(),

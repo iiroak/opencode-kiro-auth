@@ -34,6 +34,18 @@ on every request. Requests are shaped to match kiro-cli''s wire format.
 - `plugin.ts` registers the opencode `auth` hook whose loader returns the
   intercepting `fetch`.
 
+## Large images and long sessions
+
+Kiro caps the total size of a request (history plus images), returning a 400
+`CONTENT_LENGTH_EXCEEDS_THRESHOLD` when exceeded. Because opencode resends the full
+history — including every prior image — image-heavy sessions can hit this limit even
+when the token count looks small. To avoid it, the plugin keeps images only on the most
+recent image-bearing turns and replaces older ones with an `[image omitted]` marker.
+
+- Tune with `KIRO_KEEP_IMAGE_TURNS` (default `2`; `0` strips all images).
+- If a request still overflows, the error is surfaced as a context-overflow message, so
+  opencode suggests starting a new session or running `/compact`.
+
 ## Web search (no API key)
 
 The plugin also registers a `web_search` tool backed by Kiro''s built-in web search,
