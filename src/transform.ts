@@ -93,6 +93,38 @@ function toolSpecs(tools?: Block[]) {
   }))
 }
 
+/** Distinct tool names referenced by tool_use blocks across all messages. */
+function toolNamesFromMessages(messages: Message[]): string[] {
+  const names = new Set<string>()
+  for (const m of messages) {
+    if (typeof m.content === "string") continue
+    for (const b of m.content) {
+      if (b?.type === "tool_use" && typeof b.name === "string") names.add(b.name)
+    }
+  }
+  return [...names]
+}
+
+/** Does any message carry tool_use or tool_result content blocks? */
+function hasToolBlocks(messages: Message[]): boolean {
+  return messages.some(
+    (m) => typeof m.content !== "string" && m.content.some((b) => b?.type === "tool_use" || b?.type === "tool_result"),
+  )
+}
+
+/**
+ * Minimal tool specs used when the request omits tools but its history still contains
+ * tool_use/tool_result blocks (e.g. compaction/summary turns). Bedrock rejects such
+ * requests with TOOL_CONFIG_MISSING unless a toolConfig is present, so we reconstruct
+ * placeholder specs from the tool names referenced in history.
+ */
+function syntheticToolSpecs(names: string[]) {
+  if (!names.length) return undefined
+  return names.map((name) => ({
+    toolSpecification: { name, description: "", inputSchema: { json: { type: "object", properties: {} } } },
+  }))
+}
+
 function toolResults(content: string | Block[]) {
   if (typeof content === "string") return undefined
   const results = content.filter((b) => b?.type === "tool_result")
@@ -201,7 +233,6 @@ export function toKiroRequest(
   profileArn: string,
 ): { url: string; init: RequestInit } {
   const modelId = body.model || DEFAULT_MODEL
-  const tools = toolSpecs(body.tools)
 
   // CodeWhisperer has no system role: fold the system prompt into the first user turn.
   const messages = (body.messages ?? []).map((m) => ({ ...m }))
@@ -214,6 +245,15 @@ export function toKiroRequest(
           ? `${sys}\n\n${firstUser.content}`
           : [{ type: "text", text: sys }, ...firstUser.content]
     }
+  }
+
+  // Prefer the request's tools; if it sent none but the history references tools (common on
+  // compaction/summary turns), synthesize minimal specs so Bedrock doesn't reject the whole
+  // request with TOOL_CONFIG_MISSING.
+  let tools = toolSpecs(body.tools)
+  if (!tools && hasToolBlocks(messages)) {
+    const names = toolNamesFromMessages(messages)
+    tools = syntheticToolSpecs(names.length ? names : ["tool"])
   }
 
   // Keep images only on the most recent N image-bearing turns; strip older ones so the
