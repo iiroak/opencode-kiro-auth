@@ -91,15 +91,39 @@ function toolSpecs(tools?: Block[]) {
 }
 
 /**
- * Flatten every tool_use/tool_result block in the conversation into plain text.
- *
- * Used for requests that send no tools (compaction, summaries, title generation): the model
- * only needs to read the history, not re-run tools. Keeping structured tool blocks would
- * require a toolConfig and subject the historical tool calls to Bedrock's tool-format
- * validation (which rejects, e.g., inputs that don't match a synthesized empty schema). Turning
- * them into text sidesteps all of that while preserving the information for the summary.
+ * Normalize tool_use/tool_result blocks so the request always satisfies Bedrock's tool rules,
+ * which kiro-cli only ever sends in clean form. A tool id is kept as a structured pair only if:
+ *   - the request actually carries tools (`keepStructured`),
+ *   - both its tool_use and tool_result are present (no orphan from a compaction cut), and
+ *   - the tool_result turn isn't mixed with regular text (Bedrock rejects that).
+ * Every other tool_use/tool_result (orphans, mixed turns, and all blocks on tool-less requests
+ * like compaction/summaries) is degraded to plain text on BOTH sides, keeping the conversation
+ * valid while preserving the information.
  */
-function flattenToolBlocksToText(messages: Message[]): void {
+function normalizeToolBlocks(messages: Message[], keepStructured: boolean): void {
+  const info = new Map<string, { use: boolean; result: boolean; mixed: boolean }>()
+  const entry = (id: string) => {
+    let x = info.get(id)
+    if (!x) info.set(id, (x = { use: false, result: false, mixed: false }))
+    return x
+  }
+  for (const m of messages) {
+    if (typeof m.content === "string") continue
+    const hasText = m.content.some((b) => b?.type === "text" && (b.text ?? "").trim().length > 0)
+    for (const b of m.content) {
+      if (b?.type === "tool_use" && b.id) entry(b.id).use = true
+      if (b?.type === "tool_result" && b.tool_use_id) {
+        const x = entry(b.tool_use_id)
+        x.result = true
+        if (hasText) x.mixed = true
+      }
+    }
+  }
+  const keepId = (id: string) => {
+    const x = info.get(id)
+    return keepStructured && !!x && x.use && x.result && !x.mixed
+  }
+
   for (let i = 0; i < messages.length; i++) {
     const m = messages[i]
     if (typeof m.content === "string") continue
@@ -107,11 +131,13 @@ function flattenToolBlocksToText(messages: Message[]): void {
     messages[i] = {
       ...m,
       content: m.content.map((b) => {
-        if (b?.type === "tool_use") {
+        if (b?.type === "tool_use" && !keepId(b.id)) {
           const input = b.input && Object.keys(b.input).length ? ` ${JSON.stringify(b.input)}` : ""
           return { type: "text", text: `[called ${b.name}${input}]` }
         }
-        if (b?.type === "tool_result") return { type: "text", text: `[tool result]\n${stringifyResultContent(b.content)}`.trim() }
+        if (b?.type === "tool_result" && !keepId(b.tool_use_id)) {
+          return { type: "text", text: `[tool result]\n${stringifyResultContent(b.content)}`.trim() }
+        }
         return b
       }),
     }
@@ -138,37 +164,6 @@ function stringifyResultContent(content: any): string {
       .join("\n")
   }
   return content == null ? "" : JSON.stringify(content)
-}
-
-/**
- * Bedrock rejects a user turn that mixes tool_result blocks with regular text
- * ("Invalid tool use format"). opencode produces exactly that on compaction: the summary
- * prompt is appended to the same turn that returns the last tool call. When a user turn has
- * both, inline the tool result(s) as text and turn the matching tool_use in the preceding
- * assistant turn into text too, so the pair degrades to plain text and the request stays valid.
- * Pure tool-result continuations (no accompanying text) are left untouched.
- */
-function inlineMixedToolResultTurns(messages: Message[]): void {
-  for (let i = 0; i < messages.length; i++) {
-    const m = messages[i]
-    if (m.role !== "user" || typeof m.content === "string") continue
-    const results = m.content.filter((b) => b?.type === "tool_result")
-    if (!results.length) continue
-    const hasText = m.content.some((b) => b?.type === "text" && (b.text ?? "").trim().length > 0)
-    if (!hasText) continue
-
-    const ids = new Set(results.map((b) => b.tool_use_id))
-    const inlined: Block[] = results.map((b) => ({ type: "text", text: `[tool result]\n${stringifyResultContent(b.content)}`.trim() }))
-    messages[i] = { ...m, content: [...inlined, ...m.content.filter((b) => b?.type !== "tool_result")] }
-
-    const prev = messages[i - 1]
-    if (prev && prev.role === "assistant" && Array.isArray(prev.content)) {
-      messages[i - 1] = {
-        ...prev,
-        content: prev.content.map((b) => (b?.type === "tool_use" && ids.has(b.id) ? { type: "text", text: `[called ${b.name}]` } : b)),
-      }
-    }
-  }
 }
 
 function toolUses(content: string | Block[]) {
@@ -275,15 +270,9 @@ export function toKiroRequest(
   // CodeWhisperer has no system role: fold the system prompt into the first user turn.
   const messages = (body.messages ?? []).map((m) => ({ ...m }))
   const tools = toolSpecs(body.tools)
-  if (tools) {
-    // Agentic request: keep structured tool blocks, but Bedrock rejects a single user turn
-    // that mixes tool_result with text, so split those.
-    inlineMixedToolResultTurns(messages)
-  } else {
-    // Utility request (compaction/summary/title) sends no tools: flatten tool blocks to text
-    // so no toolConfig is needed and Bedrock's tool-format validation can't trip.
-    flattenToolBlocksToText(messages)
-  }
+  // Keep clean tool pairs structured when tools are present; otherwise (compaction/summaries)
+  // degrade all tool blocks to text. Also fixes orphan/mixed tool turns either way.
+  normalizeToolBlocks(messages, Boolean(tools))
 
   const sys = systemText(body.system)
   if (sys) {

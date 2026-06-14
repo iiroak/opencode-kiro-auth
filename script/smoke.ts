@@ -128,6 +128,26 @@ const pure = JSON.parse(
 ).conversationState
 checks.push(["pure continuation keeps toolResults", Boolean(pure.currentMessage.userInputMessage.userInputMessageContext.toolResults)])
 
+// 8) Orphan tool_use WITH tools present (compaction cut): degraded to text on both sides.
+const orphan = JSON.parse(
+  toKiroRequest(
+    {
+      model: "claude-sonnet-4.6",
+      tools: [{ name: "bash", description: "d", input_schema: { type: "object" } }],
+      messages: [
+        { role: "user", content: "go" },
+        { role: "assistant", content: [{ type: "tool_use", id: "orph", name: "bash", input: { cmd: "ls" } }] },
+        { role: "user", content: "what did you find?" }, // no tool_result -> orphan tool_use
+      ],
+    } as any,
+    "t",
+    "a",
+  ).init.body as string,
+).conversationState
+const orphanHasToolUse = orphan.history.some((e: any) => e.assistantResponseMessage?.toolUses)
+const orphanHasCalledText = JSON.stringify(orphan.history).includes("[called bash")
+checks.push(["orphan tool_use degraded", !orphanHasToolUse && orphanHasCalledText])
+
 let ok = true
 for (const [name, pass] of checks) {
   console.log(`${pass ? "PASS" : "FAIL"}  ${name}`)
