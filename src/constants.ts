@@ -14,7 +14,7 @@ export const TOKEN_FILE = join(SSO_CACHE_DIR, "kiro-auth-token.json")
 /** Refresh the access token this long before it expires. */
 export const EXPIRY_SKEW_MS = 5 * 60 * 1000
 
-/** Kiro CodeWhisperer endpoints + awsJson1.0 wire facts (verified against kiro-cli). */
+/** Kiro CodeWhisperer endpoints + awsJson1.0 wire facts (verified against kiro-cli v2.10.0). */
 export const KIRO_ENDPOINT = "https://runtime.us-east-1.kiro.dev/"
 /** Endpoint kiro-cli uses for the InvokeMCP operation (built-in web_search). */
 export const KIRO_MCP_ENDPOINT = "https://q.us-east-1.amazonaws.com/"
@@ -31,8 +31,8 @@ export const KIRO_ORIGIN = "KIRO_CLI"
  */
 export const KIRO_PROFILE_ARN_PLACEHOLDER = "arn:aws:codewhisperer:us-east-1:638616132270:profile/AAAACCCCXXXX"
 
-/** User-Agent matching kiro-cli. Bump KIRO_CLI_VERSION to match `kiro-cli --version`. */
-const KIRO_CLI_VERSION = "2.6.1"
+/** User-Agent matching kiro-cli v2.10.0. */
+const KIRO_CLI_VERSION = "2.10.0"
 const KIRO_SDK_API_VERSION = "0.1.16551"
 const KIRO_OS = platform() === "win32" ? "windows" : platform() === "darwin" ? "macos" : "linux"
 const ua = (api: string, metric: string) =>

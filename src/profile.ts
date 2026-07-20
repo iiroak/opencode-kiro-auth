@@ -5,11 +5,14 @@ import {
   KIRO_MGMT_USER_AGENT,
   KIRO_PROFILE_ARN_PLACEHOLDER,
 } from "./constants"
+import { readToken, type KiroToken } from "./auth"
 
 let cached: string | undefined
+let cachedToken: KiroToken | null = null
 
 /**
  * Resolve the profileArn the same way kiro-cli does, supporting every account type:
+ *   - Social tokens (GitHub/Google login): profileArn is embedded in the token itself.
  *   - IdC / enterprise accounts: use the real ARN from ListAvailableProfiles.
  *   - Builder ID accounts (incl. Builder-ID-backed Pro): the API is not authorized,
  *     so fall back to the fixed placeholder kiro-cli itself uses.
@@ -17,6 +20,17 @@ let cached: string | undefined
  */
 export async function getProfileArn(accessToken: string): Promise<string> {
   if (cached) return cached
+
+  // Check if the token has an embedded profileArn (kiro-cli v2 social login)
+  try {
+    if (!cachedToken) cachedToken = await readToken()
+    if (cachedToken?.profileArn) {
+      cached = cachedToken.profileArn
+      return cached
+    }
+  } catch {}
+
+  // Fall back to ListAvailableProfiles API
   cached = await listFirstProfileArn(accessToken).catch(() => KIRO_PROFILE_ARN_PLACEHOLDER)
   return cached
 }
