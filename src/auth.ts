@@ -25,6 +25,12 @@ type ClientRegistration = {
 export class KiroAuthError extends Error {}
 
 const KAS_DIR = join(homedir(), ".local", "share", "kiro-cli")
+
+// In-memory token cache to avoid hitting the refresh endpoint on every request,
+// and a single-flight refresh promise so concurrent requests share one refresh.
+let cachedToken: { token: KiroToken; expiresAt: number } | null = null
+let inflightRefresh: Promise<KiroToken> | null = null
+const MEMORY_TTL_MS = 30 * 1000
 const SQLITE_DB = join(KAS_DIR, "data.sqlite3")
 const SOCIAL_TOKEN_FILE = join(homedir(), ".kiro", "social_token.json")
 const SOCIAL_REFRESH_URL = "https://prod.us-east-1.auth.desktop.kiro.dev/refreshToken"
@@ -112,13 +118,44 @@ function isExpired(token: KiroToken): boolean {
  * Return a valid access token, refreshing when needed.
  * For social tokens, refresh against kiro's auth server.
  * For legacy AWS SSO tokens, use the SSO-OIDC refresh flow.
+ *
+ * Results are cached in memory for MEMORY_TTL_MS so concurrent requests don't
+ * all hit the refresh endpoint. Refreshes are single-flight: if a refresh is
+ * already in progress, callers await the same promise instead of firing their
+ * own request (this is what prevents the 429 storm when multiple opencode
+ * requests arrive at once while the token is about to expire).
  */
 export async function getValidAccessToken(): Promise<string> {
-  const token = await readToken()
-  if (!isExpired(token)) return token.accessToken
-  if (!token.refreshToken) return token.accessToken
-  const refreshed = await refresh(token)
+  const now = Date.now()
+  if (cachedToken && cachedToken.expiresAt > now && !isExpired(cachedToken.token)) {
+    return cachedToken.token.accessToken
+  }
+
+  const onDisk = await readToken()
+  if (!isExpired(onDisk)) {
+    cachedToken = { token: onDisk, expiresAt: now + MEMORY_TTL_MS }
+    return onDisk.accessToken
+  }
+  if (!onDisk.refreshToken) {
+    cachedToken = { token: onDisk, expiresAt: now + MEMORY_TTL_MS }
+    return onDisk.accessToken
+  }
+
+  const refreshed = await getOrStartRefresh(onDisk)
+  cachedToken = { token: refreshed, expiresAt: Date.now() + MEMORY_TTL_MS }
   return refreshed.accessToken
+}
+
+async function getOrStartRefresh(token: KiroToken): Promise<KiroToken> {
+  if (inflightRefresh) return inflightRefresh
+  inflightRefresh = (async () => {
+    try {
+      return await refresh(token)
+    } finally {
+      inflightRefresh = null
+    }
+  })()
+  return inflightRefresh
 }
 
 async function refresh(token: KiroToken): Promise<KiroToken> {
