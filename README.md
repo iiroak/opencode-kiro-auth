@@ -28,11 +28,43 @@ on every request. Requests are shaped to match kiro-cli''s wire format.
 - `auth.ts` reads/refreshes kiro-cli''s SSO token in place (shared cache).
 - `profile.ts` resolves the profileArn like kiro-cli: real ARN for accounts that
   have one, else the fixed Builder-ID placeholder.
+- `models.ts` reads Kiro''s model catalog (`ListAvailableModels`) to learn which
+  reasoning effort levels each model accepts and which request field to send them in.
 - `transform.ts` maps the Anthropic Messages request opencode sends into Kiro''s
   CodeWhisperer `GenerateAssistantResponse` request (text, tool calls, images), and
   converts the AWS event-stream response back into an Anthropic SSE stream.
 - `plugin.ts` registers the opencode `auth` hook whose loader returns the
   intercepting `fetch`.
+
+## Reasoning effort (variants)
+
+opencode''s variant picker maps to Kiro''s per-model reasoning effort. Configure a
+variant with an `effort` value and the plugin forwards it:
+
+```jsonc
+"claude-opus-5": {
+  "variants": {
+    "low": { "effort": "low" },
+    "max": { "effort": "max" },
+  },
+},
+```
+
+Kiro takes the level as a top-level `additionalModelRequestFields` alongside
+`conversationState` — not inside it — and the field name differs per model family:
+Claude models use `output_config.effort` (sent with an adaptive `thinking` block,
+matching kiro-cli), GPT models use `reasoning.effort`.
+
+Both the field name and the valid levels are read at runtime from
+`ListAvailableModels` (cached per process), so new models and changed level sets
+work without touching the plugin. Levels genuinely differ: `claude-opus-5` accepts
+`low…max` including `xhigh`, `claude-opus-4.6` has no `xhigh`, `gpt-5.6-*` add
+`none`, and models like `claude-sonnet-4.5` or `glm-5` expose no effort control.
+
+Requesting an unsupported level is clamped to the closest supported one rather than
+failing — Kiro rejects a bad level with a 400 `ValidationException`. If no effort is
+requested, or the model has none, the field is omitted and Kiro applies its own
+default.
 
 ## Large images and long sessions
 

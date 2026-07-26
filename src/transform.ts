@@ -22,6 +22,30 @@ type AnthropicRequest = {
   [key: string]: unknown
 }
 
+/**
+ * Read the reasoning effort opencode asked for.
+ *
+ * opencode merges the selected variant's options into the request, namespaces them
+ * under `providerOptions.anthropic` (because this provider declares
+ * `npm: "@ai-sdk/anthropic"`), and the Anthropic SDK then serializes `effort` onto
+ * the wire body as `output_config.effort`. We also accept `reasoning.effort` and a
+ * bare top-level `effort` so a variant configured either way still works.
+ *
+ * Returns undefined when no effort was requested — the caller then omits the field
+ * entirely and Kiro applies the model's own default.
+ */
+export function requestedEffort(body: AnthropicRequest): string | undefined {
+  const candidates = [
+    (body.output_config as Block | undefined)?.effort,
+    (body.reasoning as Block | undefined)?.effort,
+    body.effort,
+  ]
+  for (const value of candidates) {
+    if (typeof value === "string" && value.length > 0) return value
+  }
+  return undefined
+}
+
 const ENV_STATE = {
   operatingSystem: process.platform === "win32" ? "windows" : process.platform === "darwin" ? "macos" : "linux",
   currentWorkingDirectory: process.cwd(),
@@ -264,6 +288,7 @@ export function toKiroRequest(
   body: AnthropicRequest,
   accessToken: string,
   profileArn: string,
+  additionalModelRequestFields?: Record<string, unknown>,
 ): { url: string; init: RequestInit } {
   const modelId = body.model || DEFAULT_MODEL
 
@@ -312,6 +337,10 @@ export function toKiroRequest(
       agentContinuationId: randomUUID(),
       agentTaskType: "vibe",
     },
+    // Reasoning effort is a sibling of conversationState, not part of it — this is
+    // where kiro-cli puts it (GenerateAssistantResponseCommand.additionalModelRequestFields).
+    // Omitted entirely when no effort applies, so Kiro uses the model's default.
+    ...(additionalModelRequestFields ? { additionalModelRequestFields } : {}),
   }
 
   return {
