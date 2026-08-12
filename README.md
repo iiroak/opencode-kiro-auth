@@ -23,6 +23,30 @@ on every request. Requests are shaped to match kiro-cli''s wire format.
 4. Connect: `opencode auth login` -> pick **Kiro** -> "Use existing kiro-cli login".
 5. Run: `opencode run "hello" --model kiro/claude-sonnet-4.6`
 
+## Kiro usage command
+
+The package also provides an optional OpenCode TUI target that exposes `/kiro-usage`.
+It runs Kiro's own non-interactive usage command and displays the result in an OpenCode
+dialog, preserving Kiro's usage colors and progress bar. Configure the TUI target
+separately in `tui.json` (see `tui.example.json`):
+
+```json
+{
+  "$schema": "https://opencode.ai/tui.json",
+  "plugin": ["github:iiroak/opencode-kiro-auth"]
+}
+```
+
+The command uses `kiro-cli chat --no-interactive "/usage"`, which is the supported
+invocation in current Kiro CLI releases. Verify it directly with:
+
+```text
+bun run script/test-usage.ts
+```
+
+If `kiro-cli` is not in `PATH`, the command displays an actionable error instead of
+blocking the TUI.
+
 ## How it works
 
 - `auth.ts` reads/refreshes kiro-cli''s SSO token in place (shared cache).

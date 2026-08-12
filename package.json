@@ -5,13 +5,15 @@
   "type": "module",
   "main": "./index.ts",
   "exports": {
-    "./server": "./index.ts"
+    "./server": "./index.ts",
+    "./tui": "./src/tui.tsx"
   },
   "license": "MIT",
   "author": "Toan Doan <toandev.95@gmail.com>",
   "scripts": {
     "smoke": "bun run script/smoke.ts",
-    "check-auth": "bun run script/check-auth.ts"
+    "check-auth": "bun run script/check-auth.ts",
+    "test-usage": "bun run script/test-usage.ts"
   },
   "peerDependencies": {
     "@opencode-ai/plugin": "*"
