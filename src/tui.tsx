@@ -5,7 +5,8 @@ import { getKiroUsage, KiroUsageError } from "./usage"
 
 const commandName = "kiro.usage"
 
-type AnsiPart = { text: string; color?: string; bold?: boolean }
+type TuiApi = Parameters<TuiPlugin>[0]
+type AnsiPart = { text: string; color?: string | TuiApi["theme"]["current"]["text"]; bold?: boolean }
 
 const ANSI_COLORS: Record<string, string> = {
   "141": "#af87ff",
@@ -79,7 +80,7 @@ function compactProgressLine(line: AnsiPart[]): AnsiPart[] {
   }).filter((part) => part.text)
 }
 
-function UsageText(props: { value: string; color: string }): JSX.Element {
+function UsageText(props: { value: string; color: TuiApi["theme"]["current"]["text"] }): JSX.Element {
   const lines = parseAnsi(props.value)
   return (
     <box flexDirection="column" width="100%">
@@ -96,7 +97,7 @@ function UsageText(props: { value: string; color: string }): JSX.Element {
   )
 }
 
-function usageDialog(api: Parameters<TuiPlugin>[0], title: string, message: string, usage?: boolean) {
+function usageDialog(api: Parameters<TuiPlugin>[0], title: string, message: string, usage = false) {
   const color = api.theme.current.text
   api.ui.dialog.setSize("xlarge")
   api.ui.dialog.replace(() => (
@@ -129,7 +130,21 @@ function showUsage(api: Parameters<TuiPlugin>[0]) {
     })
 }
 
+function ThinkingIndicator(props: { api: TuiApi; sessionID: string }): JSX.Element {
+  return (
+    <box visible={props.api.state.session.status(props.sessionID)?.type === "busy"}>
+      <text fg={props.api.theme.current.textMuted}>thinking...</text>
+    </box>
+  )
+}
+
 const tui: TuiPlugin = async (api) => {
+  api.slots.register({
+    slots: {
+      session_prompt_right: (_context, props) => <ThinkingIndicator api={api} sessionID={props.session_id} />,
+    },
+  })
+
   api.keymap.registerLayer({
     commands: [
       {

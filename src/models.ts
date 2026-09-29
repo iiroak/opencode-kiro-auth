@@ -3,10 +3,13 @@ import {
   KIRO_LIST_MODELS_TARGET,
   KIRO_CONTENT_TYPE,
   KIRO_MGMT_USER_AGENT,
+  DEFAULT_MODEL,
 } from "./constants"
 
 /**
- * Per-model reasoning-effort capabilities, read from Kiro's own model catalog.
+ * Model inventory and per-model reasoning capabilities, read from Kiro's own
+ * ListAvailableModels catalog. Keeping one normalized catalog here means the
+ * picker and request transformer always use the same source of truth.
  *
  * Kiro advertises the effort levels a model accepts inside each model's
  * `additionalModelRequestFieldsSchema` (a JSON Schema), and the request field it
@@ -18,7 +21,7 @@ import {
  * kiro-cli resolves this at runtime from `ListAvailableModels` (see
  * `parseEffortLevels` / `EFFORT_SCHEMA_PATHS` in its bundled agent) rather than
  * hardcoding a table, so new models and changed level sets work without a client
- * update. We do the same, and cache the catalog for the process lifetime.
+ * update. The config hook also maps the catalog into OpenCode's provider models.
  *
  * Verified live against the API: `claude-opus-5` exposes
  * output_config.effort ∈ [low, medium, high, xhigh, max] (default high), while
@@ -46,14 +49,44 @@ const EFFORT_SCHEMA_PATHS: Array<{
   { path: "reasoning", extract: (s) => s?.properties?.reasoning?.properties?.effort },
 ]
 
-type CatalogModel = {
+export type CatalogModel = {
   modelId?: string
+  modelName?: string
+  description?: string
+  tokenLimits?: {
+    maxInputTokens?: number
+    maxOutputTokens?: number
+  }
+  supportedInputTypes?: string[]
   additionalModelRequestFieldsSchema?: unknown
 }
 
 type CatalogResponse = {
   models?: CatalogModel[]
   nextToken?: string
+  defaultModel?: string
+}
+
+export type KiroModelCatalog = {
+  models: CatalogModel[]
+  defaultModel?: string
+}
+
+type ModelModality = "text" | "audio" | "image" | "video" | "pdf"
+
+export type ProviderModelConfig = {
+  id?: string
+  name: string
+  limit: { context: number; output: number }
+  modalities: { input: ModelModality[]; output: ModelModality[] }
+  reasoning?: boolean
+  attachment?: boolean
+  temperature?: boolean
+  tool_call?: boolean
+  experimental?: boolean
+  variants?: Record<string, { effort: string }>
+  options?: Record<string, unknown>
+  headers?: Record<string, string>
 }
 
 /** Pagination cap, matching kiro-cli's own guard against a runaway nextToken loop. */
@@ -79,7 +112,9 @@ export function parseEffortLevels(schema: unknown): ModelEffort | undefined {
   return undefined
 }
 
-let catalogPromise: Promise<Map<string, ModelEffort>> | null = null
+const CATALOG_CACHE_MS = 5 * 60 * 1000
+const catalogCache = new Map<string, { expiresAt: number; value: KiroModelCatalog }>()
+const catalogInflight = new Map<string, Promise<KiroModelCatalog>>()
 
 async function fetchPage(
   accessToken: string,
@@ -100,42 +135,170 @@ async function fetchPage(
       "x-amzn-codewhisperer-optout": "false",
     },
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(15_000),
   })
   if (!res.ok) throw new Error(`ListAvailableModels failed (${res.status})`)
   return (await res.json()) as CatalogResponse
 }
 
-async function loadCatalog(accessToken: string, profileArn: string): Promise<Map<string, ModelEffort>> {
-  const out = new Map<string, ModelEffort>()
+async function loadCatalog(accessToken: string, profileArn: string): Promise<KiroModelCatalog> {
+  const models = new Map<string, CatalogModel>()
   let nextToken: string | undefined
+  let defaultModel: string | undefined
   for (let page = 0; page < MAX_PAGES; page++) {
     const data = await fetchPage(accessToken, profileArn, nextToken)
     for (const model of data.models ?? []) {
       if (!model.modelId) continue
-      const effort = parseEffortLevels(model.additionalModelRequestFieldsSchema)
-      if (effort) out.set(model.modelId, effort)
+      models.set(model.modelId, model)
     }
+    defaultModel ??= data.defaultModel
     nextToken = data.nextToken
     if (!nextToken) break
+  }
+  if (models.size === 0) throw new Error("ListAvailableModels returned no models")
+  return { models: [...models.values()], defaultModel }
+}
+
+/**
+ * Read the current Kiro model catalog, sharing an in-flight request and caching
+ * successful results briefly. Failed requests are not cached, so a later call can
+ * recover after login/network state changes.
+ */
+export async function getAvailableModels(
+  accessToken: string,
+  profileArn: string,
+): Promise<KiroModelCatalog> {
+  const cached = catalogCache.get(profileArn)
+  if (cached && cached.expiresAt > Date.now()) return cached.value
+
+  let pending = catalogInflight.get(profileArn)
+  if (!pending) {
+    pending = loadCatalog(accessToken, profileArn).then((value) => {
+      catalogCache.set(profileArn, { value, expiresAt: Date.now() + CATALOG_CACHE_MS })
+      return value
+    })
+    catalogInflight.set(profileArn, pending)
+    void pending.finally(() => {
+      if (catalogInflight.get(profileArn) === pending) catalogInflight.delete(profileArn)
+    }).catch(() => {})
+  }
+  return pending
+}
+
+/** Current default model from Kiro, falling back to its known `auto` default. */
+export async function getDefaultModel(accessToken: string, profileArn: string): Promise<string> {
+  try {
+    return (await getAvailableModels(accessToken, profileArn)).defaultModel || DEFAULT_MODEL
+  } catch {
+    return DEFAULT_MODEL
+  }
+}
+
+function positiveLimit(value: unknown, fallback: number): number {
+  return typeof value === "number" && Number.isFinite(value) && value > 0
+    ? Math.floor(value)
+    : fallback
+}
+
+function titleCase(value: string): string {
+  return value
+    .split(/[-_]/)
+    .filter(Boolean)
+    .map((part) => (/^[a-z]/i.test(part) ? part[0]!.toUpperCase() + part.slice(1) : part))
+    .join(" ")
+}
+
+/** Kiro model IDs are lowercase; use stable readable names in OpenCode's picker. */
+function displayName(modelId: string): string {
+  if (modelId === "auto") return "Auto"
+
+  const claude = modelId.match(/^claude-(opus|sonnet|haiku)-(.+)$/i)
+  if (claude) {
+    const family = claude[1]![0]!.toUpperCase() + claude[1]!.slice(1)
+    return `Claude ${family} ${claude[2]}`
+  }
+
+  const gpt = modelId.match(/^gpt-(.+)$/i)
+  if (gpt) return `GPT ${titleCase(gpt[1]!)}`
+
+  const deepseek = modelId.match(/^deepseek-(.+)$/i)
+  if (deepseek) return `DeepSeek ${titleCase(deepseek[1]!)}`
+
+  const minimax = modelId.match(/^minimax-(.+)$/i)
+  if (minimax) return `MiniMax ${titleCase(minimax[1]!)}`
+
+  const glm = modelId.match(/^glm-(.+)$/i)
+  if (glm) return `GLM-${glm[1]}`
+
+  const qwen = modelId.match(/^qwen3-(.+)$/i)
+  if (qwen) return `Qwen3 ${titleCase(qwen[1]!)}`
+
+  return titleCase(modelId)
+}
+
+const INPUT_MODALITIES: Record<string, ModelModality> = {
+  TEXT: "text",
+  AUDIO: "audio",
+  IMAGE: "image",
+  VIDEO: "video",
+  PDF: "pdf",
+}
+
+/** Convert Kiro's live catalog record to OpenCode's legacy provider config shape. */
+export function toProviderModels(models: CatalogModel[]): Record<string, ProviderModelConfig> {
+  const out: Record<string, ProviderModelConfig> = {}
+  for (const model of models) {
+    const id = model.modelId
+    if (!id) continue
+
+    const effort = parseEffortLevels(model.additionalModelRequestFieldsSchema)
+    const input = [...new Set(
+      (model.supportedInputTypes ?? ["TEXT"])
+        .map((type) => INPUT_MODALITIES[type.toUpperCase()])
+        .filter((type): type is ModelModality => type !== undefined),
+    )]
+    if (!input.includes("text")) input.unshift("text")
+
+    out[id] = {
+      name: displayName(id),
+      limit: {
+        context: positiveLimit(model.tokenLimits?.maxInputTokens, 200_000),
+        output: positiveLimit(model.tokenLimits?.maxOutputTokens, 64_000),
+      },
+      modalities: { input, output: ["text"] },
+      reasoning: Boolean(effort),
+      attachment: input.includes("image"),
+      temperature: false,
+      tool_call: true,
+      ...(model.description?.toLowerCase().includes("experimental preview")
+        ? { experimental: true }
+        : {}),
+      ...(effort
+        ? { variants: Object.fromEntries(effort.levels.map((level) => [level, { effort: level }])) }
+        : {}),
+    }
   }
   return out
 }
 
 /**
  * Effort capabilities for `modelId`, or undefined when the model advertises none
- * (or the catalog is unreachable). Cached for the process lifetime; a failed load
- * degrades to "no effort support", which means we simply omit the field and let
- * Kiro apply its own default — never a hard error on the chat path.
+ * (or the catalog is unreachable). The shared catalog cache expires after five
+ * minutes; a failed load degrades to "no effort support", so we omit the field and
+ * let Kiro apply its own default — never a hard error on the chat path.
  */
 export async function getModelEffort(
   accessToken: string,
   profileArn: string,
   modelId: string,
 ): Promise<ModelEffort | undefined> {
-  if (!catalogPromise) {
-    catalogPromise = loadCatalog(accessToken, profileArn).catch(() => new Map<string, ModelEffort>())
+  try {
+    const catalog = await getAvailableModels(accessToken, profileArn)
+    const model = catalog.models.find((entry) => entry.modelId === modelId)
+    return model ? parseEffortLevels(model.additionalModelRequestFieldsSchema) : undefined
+  } catch {
+    return undefined
   }
-  return (await catalogPromise).get(modelId)
 }
 
 /**

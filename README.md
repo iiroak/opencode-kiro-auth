@@ -52,36 +52,32 @@ blocking the TUI.
 - `auth.ts` reads/refreshes kiro-cli''s SSO token in place (shared cache).
 - `profile.ts` resolves the profileArn like kiro-cli: real ARN for accounts that
   have one, else the fixed Builder-ID placeholder.
-- `models.ts` reads Kiro''s model catalog (`ListAvailableModels`) to learn which
-  reasoning effort levels each model accepts and which request field to send them in.
+- `models.ts` reads Kiro''s model catalog (`ListAvailableModels`) for available model
+  IDs, context/output limits, input modalities, and reasoning effort levels.
 - `transform.ts` maps the Anthropic Messages request opencode sends into Kiro''s
   CodeWhisperer `GenerateAssistantResponse` request (text, tool calls, images), and
   converts the AWS event-stream response back into an Anthropic SSE stream.
-- `plugin.ts` registers the opencode `auth` hook whose loader returns the
-  intercepting `fetch`.
+- `plugin.ts` refreshes the configured Kiro model list during OpenCode startup and
+  registers the `auth` hook whose loader returns the intercepting `fetch`.
+
+The catalog is cached for five minutes inside the server process. Restart OpenCode
+to refresh model availability after Kiro publishes a new model. If discovery fails,
+the plugin logs the failure and keeps the model entries already in the config.
 
 ## Reasoning effort (variants)
 
-opencode''s variant picker maps to Kiro''s per-model reasoning effort. Configure a
-variant with an `effort` value and the plugin forwards it:
-
-```jsonc
-"claude-opus-5": {
-  "variants": {
-    "low": { "effort": "low" },
-    "max": { "effort": "max" },
-  },
-},
-```
+OpenCode''s model picker is populated from Kiro''s live model catalog, so there is no
+per-model list to maintain in `opencode.json`. The plugin creates each model''s
+available variants from the same API schema used for requests.
 
 Kiro takes the level as a top-level `additionalModelRequestFields` alongside
 `conversationState` — not inside it — and the field name differs per model family:
 Claude models use `output_config.effort` (sent with an adaptive `thinking` block,
 matching kiro-cli), GPT models use `reasoning.effort`.
 
-Both the field name and the valid levels are read at runtime from
-`ListAvailableModels` (cached per process), so new models and changed level sets
-work without touching the plugin. Levels genuinely differ: `claude-opus-5` accepts
+Both the field name and valid levels are read from `ListAvailableModels`, so new
+models and changed level sets appear after restarting OpenCode without editing the
+plugin or model config. Levels genuinely differ: `claude-opus-5` accepts
 `low…max` including `xhigh`, `claude-opus-4.6` has no `xhigh`, `gpt-5.6-*` add
 `none`, and models like `claude-sonnet-4.5` or `glm-5` expose no effort control.
 

@@ -4,8 +4,8 @@ import { join } from "node:path"
 /** opencode provider id; must match the provider key in opencode.json. */
 export const PROVIDER_ID = "kiro"
 
-/** Default model when a request omits one. Kiro rejects an empty modelId. */
-export const DEFAULT_MODEL = "claude-sonnet-4.6"
+/** Fallback when no request model or live Kiro default can be resolved. */
+export const DEFAULT_MODEL = "auto"
 
 /** kiro-cli's AWS SSO token cache. auth.ts throws if missing (run `kiro-cli login`). */
 export const SSO_CACHE_DIR = join(homedir(), ".aws", "sso", "cache")

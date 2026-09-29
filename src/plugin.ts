@@ -1,9 +1,17 @@
-import type { Hooks, PluginInput } from "@opencode-ai/plugin"
+import type { Config, Hooks, PluginInput } from "@opencode-ai/plugin"
 import { PROVIDER_ID, DEFAULT_MODEL } from "./constants"
 import { getValidAccessToken, readToken, KiroAuthError } from "./auth"
 import { toKiroRequest, kiroToAnthropicStream, mapKiroError, requestedEffort } from "./transform"
 import { getProfileArn } from "./profile"
-import { getModelEffort, resolveEffortLevel, buildEffortRequestFields } from "./models"
+import {
+  getAvailableModels,
+  getDefaultModel,
+  getModelEffort,
+  resolveEffortLevel,
+  buildEffortRequestFields,
+  toProviderModels,
+  type ProviderModelConfig,
+} from "./models"
 import { resolveContextLimit } from "./limits"
 import { tools } from "./tools"
 
@@ -39,6 +47,40 @@ async function resolveEffortFields(
 export async function KiroAuthPlugin(input: PluginInput): Promise<Hooks> {
   return {
     tool: tools,
+    // OpenCode 1.18.x skips provider.models for custom provider IDs absent from
+    // models.dev. Its config hook runs before provider initialization, so mutate
+    // the configured model map here instead.
+    config: async (config: Config) => {
+      const provider = config.provider?.[PROVIDER_ID] as unknown as
+        | { models?: Record<string, Partial<ProviderModelConfig>> }
+        | undefined
+      if (!provider) return
+
+      try {
+        const accessToken = await getValidAccessToken()
+        const profileArn = await getProfileArn(accessToken)
+        const catalog = await getAvailableModels(accessToken, profileArn)
+        const models = toProviderModels(catalog.models)
+
+        // Keep user-authored display/request overrides for models Kiro still lists,
+        // while availability, limits, modalities, and effort levels stay live.
+        for (const [id, model] of Object.entries(models)) {
+          const configured = provider.models?.[id]
+          if (!configured) continue
+          if (configured.id) model.id = configured.id
+          if (configured.name) model.name = configured.name
+          if (configured.options) model.options = configured.options
+          if (configured.headers) model.headers = configured.headers
+        }
+
+        provider.models = models
+      } catch (error) {
+        const detail = error instanceof Error ? error.message : String(error)
+        console.warn(
+          `[opencode-kiro-auth] Could not refresh Kiro's model catalog; keeping configured models. ${detail}`,
+        )
+      }
+    },
     auth: {
       provider: PROVIDER_ID,
       methods: [
@@ -63,9 +105,11 @@ export async function KiroAuthPlugin(input: PluginInput): Promise<Hooks> {
         async fetch(_input: Parameters<typeof fetch>[0], init?: RequestInit) {
           const accessToken = await getValidAccessToken()
           const body = typeof init?.body === "string" && init.body.length > 0 ? JSON.parse(init.body) : {}
-          const model = typeof body.model === "string" ? body.model : DEFAULT_MODEL
-
           const profileArn = await getProfileArn(accessToken)
+          const model =
+            typeof body.model === "string"
+              ? body.model
+              : await getDefaultModel(accessToken, profileArn).catch(() => DEFAULT_MODEL)
 
           // Translate the variant opencode selected into Kiro's per-model effort field.
           // The level set and the field name are both read from Kiro's model catalog,
