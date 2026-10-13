@@ -64,6 +64,17 @@ The catalog is cached for five minutes inside the server process. Restart OpenCo
 to refresh model availability after Kiro publishes a new model. If discovery fails,
 the plugin logs the failure and keeps the model entries already in the config.
 
+## Usage estimates and auto-compaction
+
+Kiro streams `contextUsageEvent` as a percentage, while OpenCode treats Anthropic
+`usage.input_tokens` as a token count when deciding whether to compact. The plugin
+estimates input usage from the outgoing request instead: it counts the serialized
+prompt at roughly 3.5 ASCII characters per token, counts non-ASCII characters
+conservatively, and budgets 8,000 tokens per image. Base64 image bytes are removed
+before estimating, so the encoded file size cannot turn into hundreds of thousands
+of apparent tokens. This remains an estimate and can differ from Kiro's own `/context`
+display.
+
 ## Reasoning effort (variants)
 
 OpenCode''s model picker is populated from Kiro''s live model catalog, so there is no
@@ -85,6 +96,40 @@ Requesting an unsupported level is clamped to the closest supported one rather t
 failing — Kiro rejects a bad level with a 400 `ValidationException`. If no effort is
 requested, or the model has none, the field is omitted and Kiro applies its own
 default.
+
+## Live reasoning with Kiro ACP
+
+The direct HTTP transport forwards Kiro's `reasoningContentEvent` frames as soon as
+the endpoint sends them. Kiro's HTTP endpoint can deliver the complete thinking block
+in one short burst near the end of a response, so it may appear only after the model
+finishes reasoning. To use Kiro CLI's live `agent_thought_chunk` updates instead,
+select its ACP transport:
+
+```jsonc
+"plugin": [
+  ["file:///ABSOLUTE/PATH/TO/opencode-kiro-auth", { "transport": "acp" }]
+]
+```
+
+ACP requires `kiro-cli` to be installed and logged in. It rebuilds the conversation as
+a text transcript and passes images through ACP. Kiro CLI starts a fresh ACP session
+for each completion, so expect extra startup latency. The tools OpenCode enabled for
+that request are exposed through a short-lived MCP bridge. Kiro's tool calls return as
+ordinary OpenCode tool calls, and OpenCode executes them with its existing permissions
+and MCP setup. The bridge listens only on localhost, uses a per-request random token,
+and removes its temporary configuration when the request ends. For bridged tool calls,
+Node.js must be available in the OpenCode server's `PATH`; set `KIRO_ACP_NODE_PATH` if
+the `node` executable is elsewhere.
+
+Kiro's own built-in tools remain disabled by default, so file access, shell commands,
+and other actions still go through OpenCode. To additionally allow Kiro CLI to run its
+built-in tools outside OpenCode's per-call permission prompts, set
+`"trustAcpTools": true` in the plugin options, or set `KIRO_ACP_TRUST_TOOLS=1` in the
+OpenCode server environment.
+
+For a temporary switch, set `KIRO_TRANSPORT=acp` before starting OpenCode. An explicit
+plugin option of `"transport": "api"` keeps the direct HTTP transport even when that
+environment variable is set.
 
 ## Large images and long sessions
 

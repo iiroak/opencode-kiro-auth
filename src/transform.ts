@@ -220,6 +220,42 @@ function hasImages(content: string | Block[]): boolean {
   return typeof content !== "string" && content.some(isImageBlock)
 }
 
+// Kiro emits contextUsageEvent as a percentage, but OpenCode treats Anthropic
+// usage.input_tokens as the input-token count for its automatic overflow check.
+// Estimate from the request we actually send, replacing each base64 image blob
+// with a fixed visual-token budget so its wire size is never mistaken for tokens.
+const ESTIMATED_CHARS_PER_TOKEN = 3.5
+const ESTIMATED_IMAGE_TOKENS = 8_000
+
+function withoutImageBytes(value: unknown, state: { imageCount: number }, parentKey?: string): unknown {
+  if (Array.isArray(value)) return value.map((item) => withoutImageBytes(item, state, parentKey))
+  if (value === null || typeof value !== "object") return value
+
+  const result: Record<string, unknown> = {}
+  for (const [key, item] of Object.entries(value as Record<string, unknown>)) {
+    if (parentKey === "source" && key === "bytes" && typeof item === "string") {
+      state.imageCount += 1
+      result[key] = "[image payload omitted]"
+    } else {
+      result[key] = withoutImageBytes(item, state, key)
+    }
+  }
+  return result
+}
+
+function estimateInputTokens(payload: unknown): number {
+  const state = { imageCount: 0 }
+  const serialized = JSON.stringify(withoutImageBytes(payload, state)) ?? ""
+  let asciiChars = 0
+  let nonAsciiTokens = 0
+  for (const char of serialized) {
+    const codePoint = char.codePointAt(0) ?? 0
+    if (codePoint <= 0x7f) asciiChars += 1
+    else nonAsciiTokens += codePoint > 0xffff ? 2 : 1
+  }
+  return Math.ceil(asciiChars / ESTIMATED_CHARS_PER_TOKEN + nonAsciiTokens + state.imageCount * ESTIMATED_IMAGE_TOKENS)
+}
+
 // Number of most-recent image-bearing turns whose images are sent to Kiro. Older images are
 // dropped from history (replaced with a placeholder) to keep the request under Kiro's
 // content-length threshold, which base64 images blow past in long sessions. Override with
@@ -275,10 +311,28 @@ function userEntry(
 
 function assistantEntry(msg: Message) {
   const tu = toolUses(msg.content)
+  // Kiro accepts one reasoningContent union on each assistant history entry. Only
+  // replay a thinking block when its opaque signature is present; unsigned text is
+  // fine to display, but the backend rejects it when sent back in history.
+  const blocks = typeof msg.content === "string" ? [] : msg.content
+  const thinking = blocks.find(
+    (b) => b?.type === "thinking" && typeof b.thinking === "string" && b.thinking.length > 0 &&
+      typeof b.signature === "string" && b.signature.length > 0,
+  )
+  const redacted = blocks.find(
+    (b) => b?.type === "redacted_thinking" && typeof b.data === "string" && b.data.length > 0,
+  )
+  const reasoningContent = thinking
+    ? { reasoningText: { text: thinking.thinking, signature: thinking.signature } }
+    : redacted
+      ? { redactedContent: redacted.data }
+      : undefined
+
   return {
     assistantResponseMessage: {
       content: textOf(msg.content),
       ...(tu ? { toolUses: tu } : {}),
+      ...(reasoningContent ? { reasoningContent } : {}),
     },
   }
 }
@@ -289,7 +343,7 @@ export function toKiroRequest(
   accessToken: string,
   profileArn: string,
   additionalModelRequestFields?: Record<string, unknown>,
-): { url: string; init: RequestInit } {
+): { url: string; estimatedInputTokens: number; init: RequestInit } {
   const modelId = body.model || DEFAULT_MODEL
 
   // CodeWhisperer has no system role: fold the system prompt into the first user turn.
@@ -345,11 +399,15 @@ export function toKiroRequest(
 
   return {
     url: KIRO_ENDPOINT,
+    estimatedInputTokens: estimateInputTokens(payload),
     init: {
       method: "POST",
       headers: {
         authorization: `Bearer ${accessToken}`,
         "content-type": KIRO_CONTENT_TYPE,
+        // GenerateAssistantResponse is an AWS event-stream operation; request its
+        // response media type explicitly.
+        accept: "application/vnd.amazon.eventstream",
         "x-amz-target": KIRO_TARGET,
         "user-agent": KIRO_USER_AGENT,
         "x-amz-user-agent": KIRO_X_AMZ_USER_AGENT,
@@ -369,11 +427,20 @@ function sse(event: string, data: unknown): string {
 }
 
 /** Convert Kiro's event-stream into the Anthropic Messages SSE stream opencode expects. */
-export function kiroToAnthropicStream(res: Response, model: string, contextLimit = 1_000_000): Response {
+export function kiroToAnthropicStream(
+  res: Response,
+  model: string,
+  estimatedInputTokens = 0,
+  upstreamAbort?: AbortController,
+): Response {
+  let cancelled = false
   const stream = new ReadableStream<Uint8Array>({
     async start(controller) {
       const enc = new TextEncoder()
-      const send = (event: string, data: unknown) => controller.enqueue(enc.encode(sse(event, data)))
+      const send = (event: string, data: unknown) => {
+        if (cancelled || controller.desiredSize === null) return
+        controller.enqueue(enc.encode(sse(event, data)))
+      }
 
       send("message_start", {
         type: "message_start",
@@ -393,29 +460,86 @@ export function kiroToAnthropicStream(res: Response, model: string, contextLimit
       let currentTool: string | null = null
       let usedTool = false
       let blockOpen = false
-      // Kiro emits a contextUsageEvent (percentage) and meteringEvent (credits) near the
-      // end of the stream. We translate the percentage into a token count for opencode's
-      // gauge, and estimate output tokens from the streamed text (~4 chars/token).
-      let contextPercent: number | null = null
+      let blockType: "text" | "thinking" | "tool_use" | null = null
+      let thinkingSignature = ""
+      // Kiro's contextUsageEvent is a percentage, not an Anthropic input token count.
+      // The request-based estimate is passed in by the caller; output is estimated from
+      // the streamed text (~4 chars/token).
       let outputChars = 0
 
       const closeBlock = () => {
         if (!blockOpen) return
+        if (blockType === "thinking" && thinkingSignature) {
+          // Anthropic requires the signature after all thinking text and just
+          // before content_block_stop. Kiro may deliver it on its final event.
+          send("content_block_delta", {
+            type: "content_block_delta",
+            index,
+            delta: { type: "signature_delta", signature: thinkingSignature },
+          })
+        }
         send("content_block_stop", { type: "content_block_stop", index })
         blockOpen = false
+        blockType = null
         currentTool = null
+        thinkingSignature = ""
       }
 
       try {
         for await (const ev of readKiroEvents(res)) {
+          if (ev.eventType === "reasoningContentEvent") {
+            const payload = ev.payload as {
+              text?: unknown
+              signature?: unknown
+              redactedContent?: unknown
+            }
+            const text = typeof payload.text === "string" ? payload.text : ""
+            const signature = typeof payload.signature === "string" ? payload.signature : ""
+            const redactedContent = typeof payload.redactedContent === "string" ? payload.redactedContent : ""
+
+            if (text) {
+              if (!blockOpen || blockType !== "thinking") {
+                closeBlock()
+                index += 1
+                blockOpen = true
+                blockType = "thinking"
+                send("content_block_start", {
+                  type: "content_block_start",
+                  index,
+                  content_block: { type: "thinking", thinking: "", signature: "" },
+                })
+              }
+              outputChars += text.length
+              send("content_block_delta", {
+                type: "content_block_delta",
+                index,
+                delta: { type: "thinking_delta", thinking: text },
+              })
+            }
+            if (signature && blockOpen && blockType === "thinking") thinkingSignature = signature
+
+            if (!text && redactedContent) {
+              closeBlock()
+              index += 1
+              send("content_block_start", {
+                type: "content_block_start",
+                index,
+                content_block: { type: "redacted_thinking", data: redactedContent },
+              })
+              send("content_block_stop", { type: "content_block_stop", index })
+            }
+            continue
+          }
+
           if (ev.eventType === "assistantResponseEvent") {
             const content = ev.payload.content
             if (typeof content !== "string" || content.length === 0) continue
             outputChars += content.length
-            if (currentTool || !blockOpen) {
+            if (!blockOpen || blockType !== "text") {
               closeBlock()
               index += 1
               blockOpen = true
+              blockType = "text"
               send("content_block_start", { type: "content_block_start", index, content_block: { type: "text", text: "" } })
             }
             send("content_block_delta", { type: "content_block_delta", index, delta: { type: "text_delta", text: content } })
@@ -433,6 +557,7 @@ export function kiroToAnthropicStream(res: Response, model: string, contextLimit
               currentTool = id
               usedTool = true
               blockOpen = true
+              blockType = "tool_use"
               send("content_block_start", {
                 type: "content_block_start",
                 index,
@@ -447,11 +572,7 @@ export function kiroToAnthropicStream(res: Response, model: string, contextLimit
             continue
           }
 
-          if (ev.eventType === "contextUsageEvent") {
-            const pct = (ev.payload as { contextUsagePercentage?: unknown }).contextUsagePercentage
-            if (typeof pct === "number" && Number.isFinite(pct)) contextPercent = pct
-            continue
-          }
+          if (ev.eventType === "contextUsageEvent") continue
 
           if (ev.eventType.toLowerCase().includes("exception") || ev.eventType === "error") {
             send("error", { type: "error", error: { type: "api_error", message: JSON.stringify(ev.payload) } })
@@ -459,7 +580,7 @@ export function kiroToAnthropicStream(res: Response, model: string, contextLimit
         }
 
         closeBlock()
-        const inputTokens = contextPercent != null ? Math.round((contextPercent / 100) * contextLimit) : 0
+        const inputTokens = Number.isFinite(estimatedInputTokens) ? Math.max(0, Math.round(estimatedInputTokens)) : 0
         const outputTokens = outputChars > 0 ? Math.ceil(outputChars / 4) : 0
         send("message_delta", {
           type: "message_delta",
@@ -470,8 +591,12 @@ export function kiroToAnthropicStream(res: Response, model: string, contextLimit
       } catch (error) {
         send("error", { type: "error", error: { type: "api_error", message: String(error) } })
       } finally {
-        controller.close()
+        if (!cancelled && controller.desiredSize !== null) controller.close()
       }
+    },
+    cancel(reason) {
+      cancelled = true
+      upstreamAbort?.abort(reason)
     },
   })
 

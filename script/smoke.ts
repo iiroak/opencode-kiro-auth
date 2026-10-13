@@ -62,7 +62,7 @@ const allImgs = [...payload.conversationState.history, payload.conversationState
   .flatMap((e: any) => (e.userInputMessage?.images ?? []).map((i: any) => i.source.bytes))
 checks.push(["drops oldest image", !allImgs.includes("OLD") && allImgs.includes("MID") && allImgs.includes("NEW")])
 
-// 5) Usage from context percentage.
+// 5) Usage uses the outgoing request estimate, not Kiro's context percentage.
 function frame(eventType: string, p: unknown): Buffer {
   const b = Buffer.from(JSON.stringify(p)); const name = Buffer.from(":event-type"); const v = Buffer.from(eventType)
   const vl = Buffer.alloc(2); vl.writeUInt16BE(v.length)
@@ -71,11 +71,19 @@ function frame(eventType: string, p: unknown): Buffer {
   buf.writeUInt32BE(total, o); o += 4; buf.writeUInt32BE(h.length, o); o += 4; buf.writeUInt32BE(0, o); o += 4
   h.copy(buf, o); o += h.length; b.copy(buf, o); o += b.length; buf.writeUInt32BE(0, o); return buf
 }
-const stream = Buffer.concat([frame("assistantResponseEvent", { content: "hello" }), frame("contextUsageEvent", { contextUsagePercentage: 5 })])
-const out = await kiroToAnthropicStream(new Response(new Uint8Array(stream)), "claude-sonnet-4.6", 1_000_000).text()
+const stream = Buffer.concat([frame("assistantResponseEvent", { content: "hello" }), frame("contextUsageEvent", { contextUsagePercentage: 95 })])
+const out = await kiroToAnthropicStream(new Response(new Uint8Array(stream)), "claude-sonnet-4.6", 1_234).text()
 const delta = out.split("\n").find((l) => l.startsWith("data:") && l.includes("message_delta"))
 const usage = delta ? JSON.parse(delta.slice(5)).usage : null
-checks.push(["usage input tokens", usage?.input_tokens === 50_000])
+checks.push(["usage input ignores context percentage", usage?.input_tokens === 1_234])
+
+const estimateImageRequest = (data: string) =>
+  toKiroRequest({ model: "claude-sonnet-4.6", messages: [{ role: "user", content: [img(data)] }] } as any, "t", "a")
+    .estimatedInputTokens
+checks.push([
+  "image base64 size excluded from token estimate",
+  estimateImageRequest("A") === estimateImageRequest("A".repeat(800_000)),
+])
 
 // 6) Error mapping -> context overflow phrase.
 const mapped = mapKiroError(JSON.stringify({ reason: "CONTENT_LENGTH_EXCEEDS_THRESHOLD", message: "Input content length exceeds threshold." }), 400)

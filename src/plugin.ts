@@ -1,7 +1,8 @@
-import type { Config, Hooks, PluginInput } from "@opencode-ai/plugin"
+import type { Config, Hooks, PluginInput, PluginOptions } from "@opencode-ai/plugin"
 import { PROVIDER_ID, DEFAULT_MODEL } from "./constants"
 import { getValidAccessToken, readToken, KiroAuthError } from "./auth"
 import { toKiroRequest, kiroToAnthropicStream, mapKiroError, requestedEffort } from "./transform"
+import { kiroAcpToAnthropicStream } from "./acp"
 import { getProfileArn } from "./profile"
 import {
   getAvailableModels,
@@ -12,7 +13,6 @@ import {
   toProviderModels,
   type ProviderModelConfig,
 } from "./models"
-import { resolveContextLimit } from "./limits"
 import { tools } from "./tools"
 
 /**
@@ -44,7 +44,14 @@ async function resolveEffortFields(
  * sentinel auth marker; the real bearer token is always read (and refreshed) straight
  * from kiro-cli''s own cache on every request.
  */
-export async function KiroAuthPlugin(input: PluginInput): Promise<Hooks> {
+export async function KiroAuthPlugin(input: PluginInput, options: PluginOptions = {}): Promise<Hooks> {
+  const configuredTransport = options.transport
+  const transport = configuredTransport === "acp" ||
+    (configuredTransport !== "api" && process.env.KIRO_TRANSPORT === "acp")
+      ? "acp"
+      : "api"
+  const trustAcpTools = options.trustAcpTools === true || process.env.KIRO_ACP_TRUST_TOOLS === "1"
+
   return {
     tool: tools,
     // OpenCode 1.18.x skips provider.models for custom provider IDs absent from
@@ -103,13 +110,23 @@ export async function KiroAuthPlugin(input: PluginInput): Promise<Hooks> {
       loader: async () => ({
         apiKey: "",
         async fetch(_input: Parameters<typeof fetch>[0], init?: RequestInit) {
-          const accessToken = await getValidAccessToken()
           const body = typeof init?.body === "string" && init.body.length > 0 ? JSON.parse(init.body) : {}
+          const requestedModel = typeof body.model === "string" ? body.model : undefined
+
+          if (transport === "acp") {
+            return kiroAcpToAnthropicStream(
+              body,
+              requestedModel ?? DEFAULT_MODEL,
+              requestedEffort(body),
+              input.directory,
+              trustAcpTools,
+              init?.signal,
+            )
+          }
+
+          const accessToken = await getValidAccessToken()
           const profileArn = await getProfileArn(accessToken)
-          const model =
-            typeof body.model === "string"
-              ? body.model
-              : await getDefaultModel(accessToken, profileArn).catch(() => DEFAULT_MODEL)
+          const model = requestedModel ?? await getDefaultModel(accessToken, profileArn).catch(() => DEFAULT_MODEL)
 
           // Translate the variant opencode selected into Kiro's per-model effort field.
           // The level set and the field name are both read from Kiro's model catalog,
@@ -117,7 +134,13 @@ export async function KiroAuthPlugin(input: PluginInput): Promise<Hooks> {
           const effortFields = await resolveEffortFields(accessToken, profileArn, model, body)
 
           const request = toKiroRequest(body, accessToken, profileArn, effortFields)
-          const response = await fetch(request.url, request.init)
+          // Preserve OpenCode's abort signal (timeouts, user cancellation, and
+          // stream-idle watchdogs) through this custom fetch to Kiro's endpoint.
+          const streamAbort = new AbortController()
+          const signal = init?.signal
+            ? AbortSignal.any([init.signal, streamAbort.signal])
+            : streamAbort.signal
+          const response = await fetch(request.url, { ...request.init, signal })
 
           if (!response.ok) {
             // Reshape known Kiro errors (e.g. content-length overflow) into an actionable
@@ -130,10 +153,10 @@ export async function KiroAuthPlugin(input: PluginInput): Promise<Hooks> {
             })
           }
 
-          // Context window is read from the live opencode config so the synthesized usage
-          // percentage matches what opencode shows.
-          const contextLimit = await resolveContextLimit(input.client, PROVIDER_ID, model)
-          return kiroToAnthropicStream(response, model, contextLimit)
+          // Kiro supplies context occupancy as a percentage, which OpenCode would mistake
+          // for exact input tokens and use to trigger compaction. Use the request estimate
+          // calculated with image base64 bytes excluded instead.
+          return kiroToAnthropicStream(response, model, request.estimatedInputTokens, streamAbort)
         },
       }),
     },
